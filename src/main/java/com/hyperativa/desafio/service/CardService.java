@@ -21,23 +21,23 @@ public class CardService {
     public CardResponse create(CardRequest request) {
         String cardNumber = request.getCardNumber();
 
-        // 1. Validate Luhn Algorithm
+        // Validate Card Number
         if (!CardUtils.isLuhnValid(cardNumber)) {
             throw new IllegalArgumentException("Invalid card number (Luhn check failed)");
         }
 
-        // 2. Generate SHA-256 Hash of the plain number
+        // Generate SHA-256 Hash
         String numberHash = CardUtils.generateHash(cardNumber);
 
-        // 3. Check for duplicates
+        // Check for duplicates
         if (cardRepository.existsByNumberHash(numberHash)) {
             throw new DuplicateCardException("Card already registered");
         }
 
-        // 4. Encrypt the number
+        // Encrypt the card number
         String encryptedNumber = encryptionService.encrypt(cardNumber);
 
-        // 5. Save Card entity
+        // Save Card entity
         Card card = Card.builder()
                 .encryptedNumber(encryptedNumber)
                 .numberHash(numberHash)
@@ -45,7 +45,7 @@ public class CardService {
 
         Card savedCard = cardRepository.save(card);
 
-        // 6. Return CardResponse
+        // Return CardResponse
         return CardResponse.builder()
                 .id(savedCard.getId())
                 .createdAt(savedCard.getCreatedAt())

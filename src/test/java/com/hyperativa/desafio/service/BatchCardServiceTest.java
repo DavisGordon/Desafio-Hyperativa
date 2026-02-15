@@ -59,7 +59,6 @@ class BatchCardServiceTest {
                 "text/plain",
                 fileContent.toString().getBytes());
 
-        when(cardRepository.existsByNumberHash(anyString())).thenReturn(false);
         when(encryptionService.encrypt(anyString())).thenReturn("encrypted");
 
         when(transactionTemplate.execute(any())).thenAnswer(invocation -> {

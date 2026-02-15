@@ -42,7 +42,7 @@ public class BatchCardService {
         int failedCount = 0;
 
         List<Card> buffer = new ArrayList<>(BATCH_SIZE);
-        Set<String> batchHashes = new HashSet<>(BATCH_SIZE);
+        Set<String> batchHashes = HashSet.newHashSet(BATCH_SIZE);
 
         try (BufferedReader reader = new BufferedReader(
                 new InputStreamReader(file.getInputStream(), StandardCharsets.UTF_8))) {
@@ -52,139 +52,123 @@ public class BatchCardService {
                 totalLinesProcessed++;
                 String trimmedLine = line.trim();
 
-                if (trimmedLine.isEmpty())
-                    continue;
+                if (shouldSkip(trimmedLine)) continue;
 
-                // 1. Skip Header
-                if (trimmedLine.startsWith("DESAFIO-HYPERATIVA")) {
-                    continue;
-                }
-
-                // 2. Stop at Trailer
-                if (trimmedLine.startsWith("LOTE")) {
-                    continue;
-                }
-
-                // 3. Process Data Lines
                 if (trimmedLine.startsWith("C")) {
                     try {
-                        processLine(trimmedLine, buffer, batchHashes);
+                        Card card = parseAndValidate(trimmedLine, batchHashes);
+
+                        buffer.add(card);
+                        batchHashes.add(card.getNumberHash());
+
                     } catch (Exception e) {
                         failedCount++;
-                        log.warn("Failed to process line: {}. Error: {}", trimmedLine, e.getMessage());
+                        log.debug("Validation error line {}: {}", totalLinesProcessed, e.getMessage());
                     }
                 }
 
-                // Flush buffer if full
                 if (buffer.size() >= BATCH_SIZE) {
-                    BatchResult result = saveBatch(buffer);
+                    BatchResult result = processBatch(buffer);
                     successCount += result.savedCount;
                     failedCount += result.failedCount;
-                    // Clear batch tracking
+                    
+                    // Prepare for the next batch
+                    buffer.clear();
                     batchHashes.clear();
                 }
             }
 
-            // Flush remaining
+            // Final flush (remaining items)
             if (!buffer.isEmpty()) {
-                BatchResult result = saveBatch(buffer);
+                BatchResult result = processBatch(buffer);
                 successCount += result.savedCount;
                 failedCount += result.failedCount;
-                batchHashes.clear();
             }
 
         } catch (IOException e) {
-            throw new RuntimeException("Error reading file", e);
+            log.error("IO Error processing file", e);
+            throw new RuntimeException("Error processing file", e);
         }
-
-        long duration = System.currentTimeMillis() - startTime;
 
         return BatchSummary.builder()
                 .totalLinesProcessed(totalLinesProcessed)
                 .successCount(successCount)
                 .failedCount(failedCount)
-                .durationMs(duration)
+                .durationMs(System.currentTimeMillis() - startTime)
                 .build();
     }
 
-    private void processLine(String line, List<Card> buffer, Set<String> batchHashes) {
-        // Line structure: "C" + ...
-        // Index 8-26 (1-based) => 7-26 (0-based)
+    // Helper method to avoid code duplication (DRY) and clear memory
+    private BatchResult processBatch(List<Card> buffer) {
+        BatchResult result = flushBuffer(buffer);
+        entityManager.clear(); // CRITICAL: Detach entities to free up Hibernate memory after each batch
+        return result;
+    }
 
-        String rawCard;
-        try {
-            int start = 7;
-            int end = 26;
+    private boolean shouldSkip(String line) {
+        return line.isEmpty() || line.startsWith("DESAFIO-HYPERATIVA") || line.startsWith("LOTE");
+    }
 
-            if (line.length() < start) {
-                throw new IllegalArgumentException("Line too short");
-            }
+    private Card parseAndValidate(String line, Set<String> batchHashes) {
+        // Validate Length
+        int start = 7;
+        int end = 26;
+        if (line.length() < start) throw new IllegalArgumentException("Line too short");
 
-            rawCard = line.substring(start, Math.min(line.length(), end)).trim();
-
-            if (rawCard.isEmpty()) {
-                throw new IllegalArgumentException("Empty card number");
-            }
-
-        } catch (StringIndexOutOfBoundsException e) {
-            throw new IllegalArgumentException("Invalid line format", e);
-        }
+        String rawCard = line.substring(start, Math.min(line.length(), end)).trim();
+        if (rawCard.isEmpty()) throw new IllegalArgumentException("Empty card number");
 
         // Validate Luhn
-        if (!CardUtils.isLuhnValid(rawCard)) {
-            throw new IllegalArgumentException("Invalid Luhn");
-        }
+        if (!CardUtils.isLuhnValid(rawCard)) throw new IllegalArgumentException("Invalid Luhn");
 
         // Generate Hash
         String numberHash = CardUtils.generateHash(rawCard);
 
-        // Check duplicate within global DB
-        if (cardRepository.existsByNumberHash(numberHash)) {
-            throw new IllegalArgumentException("Duplicate card (DB)");
-        }
+        // Validate Duplicates in current BATCH
+        if (batchHashes.contains(numberHash)) throw new IllegalArgumentException("Duplicate in current batch");
 
-        // Check duplicate within current batch logic
-        // We use a Set for O(1) lookup in the current batch
-        if (batchHashes.contains(numberHash)) {
-            throw new IllegalArgumentException("Duplicate in current batch");
-        }
-
-        // Encrypt
-        String encrypted = encryptionService.encrypt(rawCard);
-
-        // Add to buffer
-        Card card = Card.builder()
-                .encryptedNumber(encrypted)
+        return Card.builder()
+                .encryptedNumber(encryptionService.encrypt(rawCard))
                 .numberHash(numberHash)
                 .build();
-
-        buffer.add(card);
-        batchHashes.add(numberHash);
     }
 
-    private record BatchResult(int savedCount, int failedCount) {
-    }
+    private record BatchResult(int savedCount, int failedCount) {}
 
-    private BatchResult saveBatch(List<Card> buffer) {
-        if (buffer.isEmpty()) {
-            return new BatchResult(0, 0);
-        }
+    private BatchResult flushBuffer(List<Card> buffer) {
+        if (buffer.isEmpty()) return new BatchResult(0, 0);
 
-        int size = buffer.size();
         try {
-            transactionTemplate.execute(status -> {
+            // Happy Path: Try to save the whole batch at once
+            return transactionTemplate.execute(status -> {
                 cardRepository.saveAll(buffer);
                 entityManager.flush();
-                entityManager.clear(); // Detach entities to free memory
-                return null;
+                return new BatchResult(buffer.size(), 0);
             });
-            buffer.clear();
-            return new BatchResult(size, 0);
         } catch (Exception e) {
-            log.error("Failed to save batch of size {}. Error: {}", size, e.getMessage());
-            buffer.clear();
-            // If the batch fails, all items in it constitute a failure
-            return new BatchResult(0, size);
+            // Resilience Path: Something went wrong, switch to item-by-item saving
+            log.warn("Batch failed (possibly duplicates). Switching to item-by-item processing.");
+            return saveIndividually(buffer);
         }
+    }
+
+    private BatchResult saveIndividually(List<Card> buffer) {
+        int saved = 0;
+        int failed = 0;
+
+        for (Card card : buffer) {
+            try {
+                // New isolated transaction for each item
+                transactionTemplate.execute(status -> {
+                    cardRepository.save(card);
+                    return null;
+                });
+                saved++;
+            } catch (Exception ex) {
+                failed++;
+                log.debug("Failed to save card {}: {}", card.getNumberHash(), ex.getMessage());
+            }
+        }
+        return new BatchResult(saved, failed);
     }
 }
